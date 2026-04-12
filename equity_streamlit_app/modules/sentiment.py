@@ -430,9 +430,9 @@ def _render_av_section(tickers: list[str]) -> None:
 
     styled = (
         cmp_df.style
-        .applymap(_colour_verdict,  subset=["Verdict"])
-        .applymap(_colour_score,    subset=["Avg Score"])
-        .applymap(_colour_momentum, subset=["Momentum"])
+        .map(_colour_verdict,  subset=["Verdict"])
+        .map(_colour_score,    subset=["Avg Score"])
+        .map(_colour_momentum, subset=["Momentum"])
     )
     st.dataframe(styled, use_container_width=True)
 
