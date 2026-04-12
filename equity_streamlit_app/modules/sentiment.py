@@ -87,21 +87,51 @@ def _fetch_av_news(tickers_tuple: tuple[str, ...], limit_per_ticker: int = 30) -
 
 # ── headline scoring ──────────────────────────────────────────────────────────
 def _score_headlines(tickers: list[str]) -> pd.DataFrame:
-    """Fetch headlines from yfinance and score with VADER."""
+    """Fetch headlines from yfinance and score with VADER.
+
+    Handles both the legacy flat format (yfinance <0.2.38) and the new nested
+    format (yfinance >=0.2.38) where fields live under article["content"].
+    """
     vader = _get_vader()
     rows: list[dict] = []
 
     for tkr in tickers:
         articles = get_news(tkr, max_items=20)
         for art in articles:
-            title = art.get("title", "")
+            # ── support old flat format AND new nested content format ──────────
+            content = art.get("content", {}) or {}
+
+            # title
+            title = (
+                art.get("title")
+                or content.get("title")
+                or ""
+            )
             if not title:
                 continue
 
+            # published timestamp
             ts = art.get("providerPublishTime")
-            pub_str = (
-                datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-                if ts else "—"
+            if ts:
+                pub_str = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+            else:
+                pub_date = content.get("pubDate", "")
+                pub_str  = pub_date[:16] if pub_date else "—"
+
+            # source / publisher
+            source = (
+                art.get("publisher")
+                or art.get("source")
+                or (content.get("provider") or {}).get("displayName")
+                or ""
+            )
+
+            # URL
+            url = (
+                art.get("link")
+                or art.get("url")
+                or ((content.get("canonicalUrl") or {}).get("url"))
+                or ""
             )
 
             if vader:
@@ -121,13 +151,13 @@ def _score_headlines(tickers: list[str]) -> pd.DataFrame:
                 "Ticker":    tkr,
                 "Published": pub_str,
                 "Headline":  title,
-                "Source":    art.get("publisher", ""),
+                "Source":    source,
                 "Compound":  round(compound, 3) if compound is not None else None,
                 "Positive":  round(pos, 3)      if pos      is not None else None,
                 "Negative":  round(neg, 3)      if neg      is not None else None,
                 "Neutral":   round(neu, 3)       if neu      is not None else None,
                 "Sentiment": sentiment_label,
-                "URL":       art.get("link", ""),
+                "URL":       url,
             })
 
     return pd.DataFrame(rows)
@@ -196,6 +226,139 @@ def _mean_score_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+# ── AV helpers ────────────────────────────────────────────────────────────────
+_LABEL_ORDER = ["Bullish", "Somewhat-Bullish", "Neutral", "Somewhat-Bearish", "Bearish"]
+
+def _momentum_arrow(m: float | None) -> str:
+    if m is None:    return "—"
+    if m >  0.05:    return f"↑ +{m:.3f}"
+    if m < -0.05:    return f"↓ {m:.3f}"
+    return f"→ {m:+.3f}"
+
+
+def _summarise_ticker_av(tkr: str, feed: list[dict]) -> dict:
+    """Replicate summarize_ticker_news() from news_analysis.py for one ticker."""
+    relevant = []
+    for article in feed:
+        for ts in article.get("ticker_sentiment", []):
+            if ts["ticker"] != tkr:
+                continue
+            if float(ts.get("relevance_score", 0)) <= 0.3:
+                continue
+            try:
+                pub = datetime.strptime(article["time_published"], "%Y%m%dT%H%M%S")
+            except Exception:
+                pub = None
+            relevant.append({
+                "title":     article.get("title", ""),
+                "summary":   article.get("summary", ""),
+                "source":    article.get("source", ""),
+                "url":       article.get("url", ""),
+                "label":     ts["ticker_sentiment_label"],
+                "score":     float(ts["ticker_sentiment_score"]),
+                "relevance": float(ts["relevance_score"]),
+                "published": pub,
+            })
+
+    if not relevant:
+        return {"ticker": tkr, "verdict": "No data", "n_articles": 0, "articles": []}
+
+    relevant.sort(key=lambda x: x["relevance"], reverse=True)
+    by_time = sorted(relevant, key=lambda x: x["published"] or datetime.min)
+
+    lc = {l: 0 for l in _LABEL_ORDER}
+    for a in relevant:
+        if a["label"] in lc:
+            lc[a["label"]] += 1
+
+    bull = lc["Bullish"] + lc["Somewhat-Bullish"]
+    bear = lc["Bearish"] + lc["Somewhat-Bearish"]
+
+    scores = [a["score"] for a in by_time]
+    avg_score = float(np.mean(scores))
+    if len(scores) >= 4:
+        momentum = float(np.mean(scores[-3:])) - float(np.mean(scores[:-3]))
+    else:
+        momentum = None
+
+    sources = list(dict.fromkeys(
+        a["source"] for a in relevant[:5] if a["source"]
+    ))[:3]
+
+    return {
+        "ticker":       tkr,
+        "verdict":      "Bullish" if bull > bear else "Bearish" if bear > bull else "Neutral",
+        "bull_count":   bull,
+        "bear_count":   bear,
+        "label_counts": lc,
+        "avg_score":    avg_score,
+        "momentum":     momentum,
+        "sources":      sources,
+        "articles":     relevant[:5],   # top 5 by relevance for drilldown
+        "n_articles":   len(relevant),
+    }
+
+
+def _av_comparison_chart(summaries: list[dict]) -> go.Figure:
+    """Stacked bar: label breakdown per ticker."""
+    tickers = [s["ticker"] for s in summaries]
+    fig = go.Figure()
+    colours = {
+        "Bullish":          "#4caf50",
+        "Somewhat-Bullish": "#8bc34a",
+        "Neutral":          "#ffc107",
+        "Somewhat-Bearish": "#ff9800",
+        "Bearish":          "#f44336",
+    }
+    for label in _LABEL_ORDER:
+        fig.add_trace(go.Bar(
+            name=label,
+            x=tickers,
+            y=[s["label_counts"].get(label, 0) for s in summaries],
+            marker_color=colours[label],
+        ))
+    fig.update_layout(
+        barmode="stack",
+        title="Alpha Vantage — Sentiment Label Distribution",
+        yaxis_title="Article Count",
+        height=380,
+        template="plotly_dark",
+        margin=dict(t=50, b=40, l=50, r=20),
+        legend_title="Label",
+    )
+    return fig
+
+
+def _av_score_chart(summaries: list[dict]) -> go.Figure:
+    """Average sentiment score per ticker with momentum arrows."""
+    tickers = [s["ticker"] for s in summaries]
+    scores  = [s["avg_score"] for s in summaries]
+    colors  = [
+        "#4caf50" if v >= 0.05 else "#f44336" if v <= -0.05 else "#ffc107"
+        for v in scores
+    ]
+    labels = [
+        f"{v:+.3f}  {_momentum_arrow(s['momentum'])}"
+        for v, s in zip(scores, summaries)
+    ]
+    fig = go.Figure(go.Bar(
+        x=tickers, y=scores,
+        marker_color=colors,
+        text=labels,
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title="Alpha Vantage — Average Sentiment Score + Momentum",
+        yaxis_title="Avg Score",
+        height=360,
+        template="plotly_dark",
+        margin=dict(t=50, b=40, l=50, r=20),
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="grey", line_width=1)
+    fig.update_yaxes(range=[-1, 1])
+    return fig
+
+
 # ── AV summary section ────────────────────────────────────────────────────────
 def _render_av_section(tickers: list[str]) -> None:
     st.subheader("Alpha Vantage — Enriched Sentiment")
@@ -217,65 +380,115 @@ def _render_av_section(tickers: list[str]) -> None:
         st.warning("No articles returned from Alpha Vantage.")
         return
 
-    LABEL_ORDER = ["Bullish", "Somewhat-Bullish", "Neutral", "Somewhat-Bearish", "Bearish"]
-
-    rows = []
-    for tkr in tickers:
-        relevant = []
-        for article in feed:
-            for ts in article.get("ticker_sentiment", []):
-                if ts["ticker"] != tkr:
-                    continue
-                if float(ts.get("relevance_score", 0)) <= 0.3:
-                    continue
-                try:
-                    pub = datetime.strptime(
-                        article["time_published"], "%Y%m%dT%H%M%S"
-                    )
-                except Exception:
-                    pub = None
-                relevant.append({
-                    "label":     ts["ticker_sentiment_label"],
-                    "score":     float(ts["ticker_sentiment_score"]),
-                    "relevance": float(ts["relevance_score"]),
-                    "published": pub,
-                })
-
-        if not relevant:
-            rows.append({
-                "Ticker": tkr, "Verdict": "No data",
-                "Bull": 0, "Bear": 0, "Neutral_AV": 0,
-                "Avg Score": None, "Articles": 0,
-            })
-            continue
-
-        lc = {l: 0 for l in LABEL_ORDER}
-        for a in relevant:
-            if a["label"] in lc:
-                lc[a["label"]] += 1
-
-        bull = lc["Bullish"] + lc["Somewhat-Bullish"]
-        bear = lc["Bearish"] + lc["Somewhat-Bearish"]
-        avg  = np.mean([a["score"] for a in relevant])
-
-        rows.append({
-            "Ticker":    tkr,
-            "Verdict":   "Bullish" if bull > bear else "Bearish" if bear > bull else "Neutral",
-            "Bull":      bull,
-            "Bear":      bear,
-            "Neutral_AV": lc["Neutral"],
-            "Avg Score": round(avg, 3),
-            "Articles":  len(relevant),
-        })
-
-    av_df = pd.DataFrame(rows).set_index("Ticker")
-    av_df.rename(columns={"Neutral_AV": "Neutral"}, inplace=True)
-    st.dataframe(av_df, use_container_width=True)
+    summaries = [_summarise_ticker_av(tkr, feed) for tkr in tickers]
+    n_relevant = sum(s["n_articles"] for s in summaries)
 
     st.caption(
-        f"Source: Alpha Vantage NEWS_SENTIMENT · {len(feed)} unique articles fetched · "
+        f"{len(feed)} unique articles fetched · "
+        f"{n_relevant} relevant hits across tickers · "
         "relevance threshold > 0.30"
     )
+
+    # ── comparison table ──────────────────────────────────────────────────────
+    rows = []
+    for s in summaries:
+        lc = s.get("label_counts", {})
+        rows.append({
+            "Ticker":         s["ticker"],
+            "Verdict":        s["verdict"],
+            "Articles":       s["n_articles"],
+            "Avg Score":      round(s.get("avg_score", 0), 3) if s["n_articles"] else None,
+            "Momentum":       _momentum_arrow(s.get("momentum")),
+            "Bullish":        lc.get("Bullish", 0),
+            "Smwt Bullish":   lc.get("Somewhat-Bullish", 0),
+            "Neutral":        lc.get("Neutral", 0),
+            "Smwt Bearish":   lc.get("Somewhat-Bearish", 0),
+            "Bearish":        lc.get("Bearish", 0),
+            "Sources":        " · ".join(s.get("sources", [])) or "—",
+        })
+
+    cmp_df = pd.DataFrame(rows).set_index("Ticker")
+
+    def _colour_verdict(val):
+        if val == "Bullish":  return "color:#4caf50;font-weight:700"
+        if val == "Bearish":  return "color:#f44336;font-weight:700"
+        if val == "Neutral":  return "color:#ffc107;font-weight:700"
+        return ""
+
+    def _colour_score(val):
+        if not isinstance(val, (int, float)): return ""
+        if val >= 0.15:  return "background-color:#1b5e20;color:#fff"
+        if val >= 0.05:  return "background-color:#388e3c;color:#fff"
+        if val <= -0.15: return "background-color:#b71c1c;color:#fff"
+        if val <= -0.05: return "background-color:#c62828;color:#fff"
+        return "background-color:#f57f17;color:#000"
+
+    def _colour_momentum(val):
+        if isinstance(val, str) and val.startswith("↑"): return "color:#4caf50;font-weight:600"
+        if isinstance(val, str) and val.startswith("↓"): return "color:#f44336;font-weight:600"
+        return ""
+
+    styled = (
+        cmp_df.style
+        .applymap(_colour_verdict,  subset=["Verdict"])
+        .applymap(_colour_score,    subset=["Avg Score"])
+        .applymap(_colour_momentum, subset=["Momentum"])
+    )
+    st.dataframe(styled, use_container_width=True)
+
+    # ── charts ────────────────────────────────────────────────────────────────
+    valid = [s for s in summaries if s["n_articles"] > 0]
+    if valid:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(_av_comparison_chart(valid), use_container_width=True)
+        with c2:
+            st.plotly_chart(_av_score_chart(valid), use_container_width=True)
+
+    # ── per-ticker article drilldown ──────────────────────────────────────────
+    st.markdown("#### Article Drilldown")
+    for s in summaries:
+        verdict = s["verdict"]
+        avg     = s.get("avg_score", 0)
+        mom     = _momentum_arrow(s.get("momentum"))
+        v_color = (
+            "#4caf50" if verdict == "Bullish"
+            else "#f44336" if verdict == "Bearish"
+            else "#ffc107"
+        )
+
+        header = (
+            f"**{s['ticker']}** &nbsp;·&nbsp; "
+            f"<span style='color:{v_color};font-weight:700'>{verdict}</span> &nbsp;·&nbsp; "
+            f"Avg score: **{avg:+.3f}** &nbsp;·&nbsp; Momentum: **{mom}** &nbsp;·&nbsp; "
+            f"{s['n_articles']} articles"
+        )
+
+        with st.expander(s["ticker"] + f"  —  {verdict}  |  score {avg:+.3f}  |  {s['n_articles']} articles"):
+            st.markdown(header, unsafe_allow_html=True)
+            if not s["articles"]:
+                st.caption("No relevant articles found.")
+                continue
+            for a in s["articles"]:
+                icon = (
+                    "🟢" if "Bullish"  in a["label"]
+                    else "🔴" if "Bearish" in a["label"]
+                    else "⚪"
+                )
+                pub_str = a["published"].strftime("%Y-%m-%d %H:%M") if a["published"] else "—"
+                snippet = (a["summary"][:200].rsplit(" ", 1)[0] + "…") if a["summary"] else ""
+
+                title_md = (
+                    f"[{a['title']}]({a['url']})" if a["url"] else a["title"]
+                )
+                st.markdown(
+                    f"{icon} **{a['label']}** &nbsp; score `{a['score']:+.3f}` &nbsp; "
+                    f"relevance `{a['relevance']:.2f}` &nbsp; [{a['source']}] &nbsp; {pub_str}  \n"
+                    f"{title_md}  \n"
+                    f"<span style='color:#aaa;font-size:0.85em'>{snippet}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.divider()
 
 
 # ── public render function ────────────────────────────────────────────────────
