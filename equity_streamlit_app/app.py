@@ -20,8 +20,8 @@ from __future__ import annotations
 
 # Load .env from this folder or any parent (picks up Equity_Analysis/.env locally;
 # on Streamlit Community Cloud the file won't exist and this is a silent no-op).
-from dotenv import load_dotenv
-load_dotenv(override=False)   # won't overwrite vars already set in the environment
+#from dotenv import load_dotenv
+#load_dotenv(override=False)   # won't overwrite vars already set in the environment
 
 import streamlit as st
 
