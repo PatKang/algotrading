@@ -18,6 +18,11 @@ Adding a new module
 """
 from __future__ import annotations
 
+# Load .env from this folder or any parent (picks up Equity_Analysis/.env locally;
+# on Streamlit Community Cloud the file won't exist and this is a silent no-op).
+from dotenv import load_dotenv
+load_dotenv(override=False)   # won't overwrite vars already set in the environment
+
 import streamlit as st
 
 # ── page config (must be first Streamlit call) ────────────────────────────────
@@ -40,7 +45,15 @@ import plotly.graph_objects as go
 
 
 # ── default tickers ───────────────────────────────────────────────────────────
-_DEFAULT = "ACMR, GXO, SMCI, AAPL, MSFT"
+_DEFAULTS = ["ACMR", "GXO", "SMCI", "AAPL", "MSFT"]
+
+_SUGGESTIONS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK-B",
+    "JPM", "V", "UNH", "XOM", "JNJ", "WMT", "PG", "MA", "HD", "CVX",
+    "MRK", "ABBV", "AVGO", "PEP", "KO", "LLY", "TMO", "COST", "CSCO",
+    "ACN", "MCD", "BAC", "NFLX", "CRM", "ADBE", "AMD", "INTC", "QCOM",
+    "GXO", "ACMR", "SMCI", "BN", "NEM", "GS", "MS", "SPGI", "BLK",
+]
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
@@ -52,19 +65,67 @@ with st.sidebar:
     )
     st.markdown("---")
 
-    raw_input = st.text_area(
-        "Tickers (comma-separated):",
-        value=_DEFAULT,
-        height=110,
-        help="Enter any valid Yahoo Finance tickers, e.g. AAPL, MSFT, NVDA",
-    )
-    tickers: list[str] = [t.strip().upper() for t in raw_input.split(",") if t.strip()]
+    # Initialise session state on first load
+    if "tickers" not in st.session_state:
+        st.session_state["tickers"] = _DEFAULTS.copy()
 
-    if not tickers:
-        st.error("Enter at least one ticker.")
+    st.markdown("**Tickers**")
+
+    # ── add a ticker ──────────────────────────────────────────────────────────
+    add_col, btn_col = st.columns([3, 1])
+    with add_col:
+        new_ticker = st.text_input(
+            "Add ticker:",
+            value="",
+            placeholder="e.g. NVDA",
+            label_visibility="collapsed",
+            key="ticker_input",
+        ).strip().upper()
+    with btn_col:
+        st.markdown("<br>", unsafe_allow_html=True)   # vertical alignment
+        add_clicked = st.button("Add", use_container_width=True)
+
+    if add_clicked and new_ticker:
+        if new_ticker not in st.session_state["tickers"]:
+            st.session_state["tickers"].append(new_ticker)
+        # clear the input by resetting its key
+        st.rerun()
+
+    # ── quick-add from popular suggestions ───────────────────────────────────
+    with st.expander("Quick-add popular tickers"):
+        available = [t for t in _SUGGESTIONS if t not in st.session_state["tickers"]]
+        chosen = st.multiselect(
+            "Select to add:",
+            options=available,
+            default=[],
+            key="quick_add",
+            label_visibility="collapsed",
+        )
+        if chosen:
+            for t in chosen:
+                if t not in st.session_state["tickers"]:
+                    st.session_state["tickers"].append(t)
+            st.rerun()
+
+    # ── current ticker list (removable) ──────────────────────────────────────
+    st.markdown("**Active tickers** — click × to remove")
+    to_remove = []
+    cols = st.columns(3)
+    for i, tkr in enumerate(st.session_state["tickers"]):
+        with cols[i % 3]:
+            if st.button(f"{tkr} ×", key=f"rm_{tkr}", use_container_width=True):
+                to_remove.append(tkr)
+    if to_remove:
+        for t in to_remove:
+            st.session_state["tickers"].remove(t)
+        st.rerun()
+
+    if not st.session_state["tickers"]:
+        st.error("Add at least one ticker.")
         st.stop()
 
-    st.markdown(f"**{len(tickers)} ticker(s) loaded**")
+    tickers: list[str] = st.session_state["tickers"]
+
     st.markdown("---")
     st.markdown(
         "**Modules**\n"
