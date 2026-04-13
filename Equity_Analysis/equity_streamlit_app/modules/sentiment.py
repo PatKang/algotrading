@@ -9,15 +9,20 @@ Module 3 — Headline Sentiment
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.data import get_news
-from utils.formatting import sentiment_color
+from utils.data import (
+    get_news,
+    get_major_holders,
+    get_institutional_holders,
+    get_insider_transactions,
+)
+
 
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -113,7 +118,7 @@ def _score_headlines(tickers: list[str]) -> pd.DataFrame:
             # published timestamp
             ts = art.get("providerPublishTime")
             if ts:
-                pub_str = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+                pub_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
             else:
                 pub_date = content.get("pubDate", "")
                 pub_str  = pub_date[:16] if pub_date else "—"
@@ -359,6 +364,249 @@ def _av_score_chart(summaries: list[dict]) -> go.Figure:
     return fig
 
 
+# ── ownership & insider helpers ───────────────────────────────────────────────
+def _parse_major_holders(df: pd.DataFrame) -> dict:
+    """Pull insider %, institution %, institution count from major_holders DF.
+
+    Handles both the new yfinance index style ('insidersPercentHeld') and the
+    older label style ('% of Shares Held by All Insider').
+    """
+    out: dict = {"insider_pct": None, "inst_pct": None, "inst_count": None}
+    if df is None or df.empty:
+        return out
+    try:
+        val = df.iloc[:, 0]
+        idx = [str(i).lower() for i in df.index]
+        for i, label in enumerate(idx):
+            try:
+                v = val.iloc[i]
+                if "insider" in label and ("percent" in label or "held" in label):
+                    out["insider_pct"] = float(v)
+                elif (
+                    "institution" in label
+                    and ("percent" in label or "held" in label)
+                    and "float" not in label
+                ):
+                    out["inst_pct"] = float(v)
+                elif ("institution" in label and "count" in label) or (
+                    "number" in label and "institution" in label
+                ):
+                    out["inst_count"] = int(float(v))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def _classify_from_text(text: str, txn_col: str = "") -> str:
+    """Classify insider transaction as Buy / Sell / Exercise / Grant / Unknown.
+
+    yfinance stores the human-readable description in the 'Text' column
+    (e.g. 'Sale at price 255.12 per share.').  The 'Transaction' column is
+    typically empty in current yfinance versions, so we fall back to it only
+    as a secondary check.
+    """
+    combined = (str(text) + " " + str(txn_col)).lower().strip()
+    if not combined.strip():
+        return "Unknown"
+
+    # Explicit purchase / sale keywords first
+    if "purchase" in combined:
+        return "Buy"
+    if "sale" in combined or "sold" in combined:
+        return "Sell"
+
+    # Option / derivative exercise — usually a net acquisition but distinct
+    if "exercise" in combined or "conversion" in combined:
+        return "Exercise"
+
+    # Equity award, grant, inheritance
+    if "award" in combined or "grant" in combined or "gift" in combined:
+        return "Grant"
+
+    # Single-letter SEC codes (older yfinance or fallback)
+    t = combined.strip()
+    if t == "p":
+        return "Buy"
+    if t == "s":
+        return "Sell"
+
+    return "Unknown"
+
+
+def _render_ownership_section(tickers: list[str]) -> None:
+    st.subheader("🏦 Smart Money & Insider Activity")
+    st.caption(
+        "Source: yfinance (SEC filings via Yahoo Finance). "
+        "Insider transactions reflect Form 4 filings. "
+        "Institutional holdings are reported quarterly via 13F filings and may lag "
+        "the current date by up to 45 days."
+    )
+
+    with st.spinner("Loading ownership and insider data…"):
+        major_data   = {t: get_major_holders(t)         for t in tickers}
+        inst_data    = {t: get_institutional_holders(t) for t in tickers}
+        insider_data = {t: get_insider_transactions(t)  for t in tickers}
+
+    # ── 1. Ownership snapshot ─────────────────────────────────────────────────
+    st.markdown("#### Ownership Snapshot")
+    snap_rows = []
+    for tkr in tickers:
+        mh = _parse_major_holders(major_data.get(tkr))
+        snap_rows.append({
+            "Ticker":          tkr,
+            "% Insider Owned": (
+                f"{mh['insider_pct'] * 100:.2f}%"
+                if mh["insider_pct"] is not None else "—"
+            ),
+            "% Institutional": (
+                f"{mh['inst_pct'] * 100:.2f}%"
+                if mh["inst_pct"] is not None else "—"
+            ),
+            "# Institutions": (
+                f"{mh['inst_count']:,}"
+                if mh["inst_count"] is not None else "—"
+            ),
+        })
+    st.dataframe(
+        pd.DataFrame(snap_rows).set_index("Ticker"),
+        use_container_width=True,
+    )
+
+    st.divider()
+
+    # ── 2. Recent insider transactions ────────────────────────────────────────
+    st.markdown("#### Recent Insider Transactions")
+
+    all_rows: list[dict] = []
+    for tkr in tickers:
+        raw = insider_data.get(tkr, pd.DataFrame())
+        if raw is None or raw.empty:
+            continue
+        df = raw.reset_index()
+        for _, row in df.iterrows():
+            insider  = row.get("Insider")  or row.get("insider")   or "—"
+            position = row.get("Position") or row.get("position")  or "—"
+            shares   = row.get("Shares")   or row.get("shares")
+            value    = row.get("Value")    or row.get("value")
+            # Description lives in Text; Transaction col is empty in current yfinance
+            text_desc = str(row.get("Text") or row.get("text") or "").strip()
+            txn_col   = str(row.get("Transaction") or row.get("transaction") or "").strip()
+            # Date column is 'Start Date' (with space) in current yfinance
+            date_raw  = (
+                row.get("Start Date")
+                or row.get("startDate")
+                or row.get("date")
+            )
+            try:
+                date_val = pd.to_datetime(date_raw).date()
+            except Exception:
+                date_val = None
+
+            side = _classify_from_text(text_desc, txn_col)
+            # Truncate long descriptions for display
+            desc_display = (text_desc[:80] + "…") if len(text_desc) > 80 else text_desc or "—"
+
+            all_rows.append({
+                "Ticker":      tkr,
+                "Date":        date_val,
+                "Insider":     insider,
+                "Title":       position,
+                "Side":        side,
+                "Description": desc_display,
+                "Shares":      int(shares) if pd.notna(shares) else None,
+                "Value ($)":   float(value) if pd.notna(value) else None,
+            })
+
+    if all_rows:
+        ins_df = (
+            pd.DataFrame(all_rows)
+            .sort_values("Date", ascending=False, na_position="last")
+            .reset_index(drop=True)
+        )
+
+        _SIDE_COLORS = {
+            "Buy":      "color:#4caf50;font-weight:700",
+            "Sell":     "color:#f44336;font-weight:700",
+            "Exercise": "color:#29b6f6;font-weight:600",
+            "Grant":    "color:#ab47bc;font-weight:600",
+            "Unknown":  "color:#888",
+        }
+
+        def _color_side(val: str) -> str:
+            return _SIDE_COLORS.get(val, "color:#888")
+
+        styled = ins_df.style.applymap(_color_side, subset=["Side"])
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            column_config={
+                "Shares":      st.column_config.NumberColumn(format="%d"),
+                "Value ($)":   st.column_config.NumberColumn(format="$%,.0f"),
+                "Description": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+        # Net signal: count only confirmed Buy / Sell (exclude Exercise, Grant, Unknown)
+        st.markdown("**Net Insider Signal** (open-market buys vs. sales only)")
+        sig_cols = st.columns(len(tickers))
+        for col, tkr in zip(sig_cols, tickers):
+            sub    = ins_df[ins_df["Ticker"] == tkr]
+            n_buy  = int((sub["Side"] == "Buy").sum())
+            n_sell = int((sub["Side"] == "Sell").sum())
+            n_other = int(sub["Side"].isin(["Exercise", "Grant", "Unknown"]).sum())
+            total  = n_buy + n_sell
+            if total == 0:
+                label, color = "⚪ No data", "#888"
+            elif n_buy > n_sell:
+                label, color = "🟢 Net Buyer", "#4caf50"
+            elif n_sell > n_buy:
+                label, color = "🔴 Net Seller", "#f44336"
+            else:
+                label, color = "🟡 Mixed", "#ffc107"
+            with col:
+                st.markdown(
+                    f"**{tkr}**  \n"
+                    f"<span style='color:{color};font-weight:700'>{label}</span>",
+                    unsafe_allow_html=True,
+                )
+                parts = []
+                if n_buy:    parts.append(f"{n_buy} buy")
+                if n_sell:   parts.append(f"{n_sell} sell")
+                if n_other:  parts.append(f"{n_other} other")
+                if parts:
+                    st.caption(" · ".join(parts))
+    else:
+        st.caption("No insider transaction data available for the selected tickers.")
+
+    st.divider()
+
+    # ── 3. Top institutional holders ─────────────────────────────────────────
+    st.markdown("#### Top Institutional Holders")
+    for tkr in tickers:
+        df = inst_data.get(tkr, pd.DataFrame())
+        n_holders = 0 if (df is None or df.empty) else min(len(df), 10)
+        with st.expander(f"**{tkr}** — top {n_holders} holders"):
+            if df is None or df.empty:
+                st.caption("No institutional holder data available.")
+                continue
+            desired = ["Holder", "Shares", "% Out", "Value", "Date Reported"]
+            cols_avail = [c for c in desired if c in df.columns]
+            display = df[cols_avail].head(10).copy() if cols_avail else df.head(10).copy()
+            # format % Out as a readable percentage
+            if "% Out" in display.columns:
+                display["% Out"] = display["% Out"].apply(
+                    lambda x: f"{x * 100:.2f}%" if pd.notna(x) else "—"
+                )
+            col_cfg = {}
+            if "Shares" in display.columns:
+                col_cfg["Shares"] = st.column_config.NumberColumn(format="%d")
+            if "Value" in display.columns:
+                col_cfg["Value"]  = st.column_config.NumberColumn(format="$%,.0f")
+            st.dataframe(display, use_container_width=True, column_config=col_cfg)
+
+
 # ── AV summary section ────────────────────────────────────────────────────────
 def _render_av_section(tickers: list[str]) -> None:
     st.subheader("Alpha Vantage — Enriched Sentiment")
@@ -537,6 +785,9 @@ def render_sentiment(tickers: list[str]) -> None:
 
     st.divider()
 
+    # ── smart money & insider activity ────────────────────────────────────────
+    _render_ownership_section(tickers)
+
     # ── per-ticker headline table ─────────────────────────────────────────────
     st.subheader("Headlines by Ticker")
 
@@ -557,14 +808,6 @@ def render_sentiment(tickers: list[str]) -> None:
         view_df = view_df[view_df["Ticker"] == filter_tkr]
     if filter_sent:
         view_df = view_df[view_df["Sentiment"].isin(filter_sent)]
-
-    # make headlines clickable
-    def _make_link(row):
-        url = row.get("URL", "")
-        headline = row.get("Headline", "")
-        if url:
-            return f'<a href="{url}" target="_blank">{headline}</a>'
-        return headline
 
     display_df = view_df[
         ["Ticker", "Published", "Source", "Headline", "Compound", "Sentiment"]

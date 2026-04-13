@@ -78,3 +78,34 @@ def get_infos(tickers: list[str]) -> dict[str, dict]:
 
 def get_histories(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
     return {t: get_history(t, period) for t in tickers}
+
+
+# ── ownership & insider data ───────────────────────────────────────────────────
+@st.cache_data(ttl=_INFO_TTL, show_spinner=False)
+def get_major_holders(ticker: str) -> pd.DataFrame:
+    """Return yfinance .major_holders (insider %, institution %, # institutions)."""
+    try:
+        df = yf.Ticker(ticker).major_holders
+        return df if df is not None and not df.empty else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=_INFO_TTL, show_spinner=False)
+def get_institutional_holders(ticker: str) -> pd.DataFrame:
+    """Return yfinance .institutional_holders; empty DataFrame on error."""
+    try:
+        df = yf.Ticker(ticker).institutional_holders
+        return df if df is not None and not df.empty else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=_INFO_TTL, show_spinner=False)
+def get_insider_transactions(ticker: str) -> pd.DataFrame:
+    """Return yfinance .insider_transactions (Form 4 filings); empty DF on error."""
+    try:
+        df = yf.Ticker(ticker).insider_transactions
+        return df if df is not None and not df.empty else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
