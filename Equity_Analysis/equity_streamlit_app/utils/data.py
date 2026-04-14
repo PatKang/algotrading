@@ -30,8 +30,8 @@ def get_info(ticker: str) -> dict:
         info = _ticker(ticker).info or {}
         if info:
             return info
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch info for **{ticker}** ({type(e).__name__}: {e}). Yahoo Finance may be blocking this environment.")
 
     # fast_info is a lighter endpoint — try as fallback
     try:
@@ -61,14 +61,16 @@ def get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         income = t.income_stmt
         if income is None or income.empty:
             income = getattr(t, "financials", pd.DataFrame())
-    except Exception:
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch income statement for **{ticker}** ({type(e).__name__}: {e}).")
         income = pd.DataFrame()
 
     try:
         balance = t.balance_sheet
         if balance is None or balance.empty:
             balance = pd.DataFrame()
-    except Exception:
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch balance sheet for **{ticker}** ({type(e).__name__}: {e}).")
         balance = pd.DataFrame()
 
     return income, balance
@@ -81,7 +83,8 @@ def get_news(ticker: str, max_items: int = 20) -> list[dict]:
     try:
         raw = _ticker(ticker).news or []
         return raw[:max_items]
-    except Exception:
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch news for **{ticker}** ({type(e).__name__}: {e}).")
         return []
 
 
