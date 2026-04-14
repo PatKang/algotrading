@@ -537,7 +537,7 @@ def _render_ownership_section(tickers: list[str]) -> None:
         def _color_side(val: str) -> str:
             return _SIDE_COLORS.get(val, "color:#888")
 
-        styled = ins_df.style.applymap(_color_side, subset=["Side"])
+        styled = ins_df.style.map(_color_side, subset=["Side"])
         st.dataframe(
             styled,
             use_container_width=True,
@@ -678,9 +678,9 @@ def _render_av_section(tickers: list[str]) -> None:
 
     styled = (
         cmp_df.style
-        .applymap(_colour_verdict,  subset=["Verdict"])
-        .applymap(_colour_score,    subset=["Avg Score"])
-        .applymap(_colour_momentum, subset=["Momentum"])
+        .map(_colour_verdict,  subset=["Verdict"])
+        .map(_colour_score,    subset=["Avg Score"])
+        .map(_colour_momentum, subset=["Momentum"])
     )
     st.dataframe(styled, use_container_width=True)
 
