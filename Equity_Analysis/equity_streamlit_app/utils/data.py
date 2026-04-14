@@ -6,7 +6,6 @@ Community Cloud) do not hammer the upstream APIs.
 """
 from __future__ import annotations
 
-import requests
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -17,26 +16,10 @@ _PRICE_TTL  = 900   # 15 min — price / history
 _INFO_TTL   = 3600  # 1 h  — fundamentals / metadata
 _NEWS_TTL   = 1800  # 30 min — news / sentiment
 
-# Browser-like User-Agent helps avoid Yahoo Finance IP blocks on cloud hosts
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-
-def _session() -> requests.Session:
-    """Return a requests.Session with a browser User-Agent."""
-    s = requests.Session()
-    s.headers.update(_HEADERS)
-    return s
-
 
 def _ticker(symbol: str) -> yf.Ticker:
-    """Return a yf.Ticker that uses a browser-spoofed session."""
-    return yf.Ticker(symbol, session=_session())
+    """Return a yf.Ticker; let yfinance manage its own session/cookies."""
+    return yf.Ticker(symbol)
 
 
 # ── ticker info ───────────────────────────────────────────────────────────────
