@@ -6,6 +6,7 @@ Community Cloud) do not hammer the upstream APIs.
 """
 from __future__ import annotations
 
+import requests
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -16,13 +17,43 @@ _PRICE_TTL  = 900   # 15 min — price / history
 _INFO_TTL   = 3600  # 1 h  — fundamentals / metadata
 _NEWS_TTL   = 1800  # 30 min — news / sentiment
 
+# Browser-like User-Agent helps avoid Yahoo Finance IP blocks on cloud hosts
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _session() -> requests.Session:
+    """Return a requests.Session with a browser User-Agent."""
+    s = requests.Session()
+    s.headers.update(_HEADERS)
+    return s
+
+
+def _ticker(symbol: str) -> yf.Ticker:
+    """Return a yf.Ticker that uses a browser-spoofed session."""
+    return yf.Ticker(symbol, session=_session())
+
 
 # ── ticker info ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=_INFO_TTL, show_spinner=False)
 def get_info(ticker: str) -> dict:
-    """Return yfinance .info dict; empty dict on error."""
+    """Return yfinance .info dict; falls back to fast_info keys on error."""
     try:
-        return yf.Ticker(ticker).info or {}
+        info = _ticker(ticker).info or {}
+        if info:
+            return info
+    except Exception:
+        pass
+
+    # fast_info is a lighter endpoint — try as fallback
+    try:
+        fi = _ticker(ticker).fast_info
+        return {k: getattr(fi, k, None) for k in fi.__dict__ if not k.startswith("_")}
     except Exception:
         return {}
 
@@ -32,7 +63,7 @@ def get_info(ticker: str) -> dict:
 def get_history(ticker: str, period: str = "2y") -> pd.DataFrame:
     """Return OHLCV history; empty DataFrame on error."""
     try:
-        df = yf.Ticker(ticker).history(period=period)
+        df = _ticker(ticker).history(period=period)
         return df if not df.empty else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -42,7 +73,7 @@ def get_history(ticker: str, period: str = "2y") -> pd.DataFrame:
 @st.cache_data(ttl=_INFO_TTL, show_spinner=False)
 def get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (income_stmt, balance_sheet); empty DataFrames on error."""
-    t = yf.Ticker(ticker)
+    t = _ticker(ticker)
     try:
         income = t.income_stmt
         if income is None or income.empty:
@@ -65,7 +96,7 @@ def get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 def get_news(ticker: str, max_items: int = 20) -> list[dict]:
     """Return list of news dicts from yfinance; empty list on error."""
     try:
-        raw = yf.Ticker(ticker).news or []
+        raw = _ticker(ticker).news or []
         return raw[:max_items]
     except Exception:
         return []
@@ -85,7 +116,7 @@ def get_histories(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFr
 def get_major_holders(ticker: str) -> pd.DataFrame:
     """Return yfinance .major_holders (insider %, institution %, # institutions)."""
     try:
-        df = yf.Ticker(ticker).major_holders
+        df = _ticker(ticker).major_holders
         return df if df is not None and not df.empty else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -95,7 +126,7 @@ def get_major_holders(ticker: str) -> pd.DataFrame:
 def get_institutional_holders(ticker: str) -> pd.DataFrame:
     """Return yfinance .institutional_holders; empty DataFrame on error."""
     try:
-        df = yf.Ticker(ticker).institutional_holders
+        df = _ticker(ticker).institutional_holders
         return df if df is not None and not df.empty else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -105,7 +136,7 @@ def get_institutional_holders(ticker: str) -> pd.DataFrame:
 def get_insider_transactions(ticker: str) -> pd.DataFrame:
     """Return yfinance .insider_transactions (Form 4 filings); empty DF on error."""
     try:
-        df = yf.Ticker(ticker).insider_transactions
+        df = _ticker(ticker).insider_transactions
         return df if df is not None and not df.empty else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
