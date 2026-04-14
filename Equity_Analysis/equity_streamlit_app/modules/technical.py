@@ -411,7 +411,7 @@ def render_technical(tickers: list[str]) -> None:
             }
             return colours.get(val, "")
 
-        styled = sig_df.style.applymap(_color_signal, subset=["Signal"])
+        styled = sig_df.style.map(_color_signal, subset=["Signal"])
         st.dataframe(styled, use_container_width=True)
 
     st.divider()
