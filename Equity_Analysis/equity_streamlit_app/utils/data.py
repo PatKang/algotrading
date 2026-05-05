@@ -4,12 +4,13 @@ Cached data-fetching layer.  All functions use st.cache_data so that
 repeated renders within the same session (and across users on Streamlit
 Community Cloud) do not hammer the upstream APIs.
 
-Primary source for fundamentals: Financial Modeling Prep (FMP).
+Primary source for all data: Financial Modeling Prep (FMP).
 Fallback: yfinance.
 """
 from __future__ import annotations
 
 import os
+from datetime import date, timedelta
 
 import requests
 import streamlit as st
@@ -68,7 +69,7 @@ def _fmp_get_info(ticker: str) -> dict | None:
         # Parse 52-week range string "low-high" (both sides are positive floats)
         raw_range = str(p.get("range", "") or "")
         if "-" in raw_range:
-            parts = raw_range.split("-", 1)
+            parts = raw_range.replace(" ", "").split("-")
             try:
                 week52_low  = float(parts[0].strip())
                 week52_high = float(parts[1].strip())
@@ -132,12 +133,7 @@ def _fmp_get_info(ticker: str) -> dict | None:
                 "returnOnAssets":               m.get("roaTTM"),
                 "debtToEquity":                 dte,
                 "currentRatio":                 m.get("currentRatioTTM"),
-                # FMP dividendYieldTTM is in percentage (e.g. 2.55); fmt_pct()
-                # expects a 0-to-1 fraction, so divide by 100.
-                "dividendYield": (
-                    m["dividendYieldTTM"] / 100
-                    if m.get("dividendYieldTTM") is not None else None
-                ),
+                "dividendYield":                m.get("dividendYieldTTM"),
                 "ebitda":                       m.get("ebitdaTTM"),
             })
     except Exception:
@@ -260,6 +256,188 @@ def _fmp_get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame] | None
     return income_df, balance_df
 
 
+# ── FMP: price history ────────────────────────────────────────────────────────
+def _period_to_from_date(period: str) -> str | None:
+    """Map a yfinance-style period string to an ISO date for FMP's 'from' param."""
+    mapping = {
+        "1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180,
+        "1y": 365, "2y": 730, "5y": 1825, "10y": 3650,
+    }
+    if period == "max":
+        return None
+    if period == "ytd":
+        return date(date.today().year, 1, 1).strftime("%Y-%m-%d")
+    days = mapping.get(period, 730)
+    return (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _fmp_get_history(ticker: str, period: str = "2y") -> pd.DataFrame | None:
+    """Fetch daily OHLCV from FMP historical-price-full endpoint.
+
+    Returns a DataFrame with the same column structure as yfinance
+    (Open, High, Low, Close, Volume; DatetimeIndex), or None on failure.
+    """
+    api_key = _get_fmp_key()
+    if not api_key:
+        return None
+
+    params: dict = {"apikey": api_key}
+    from_date = _period_to_from_date(period)
+    if from_date:
+        params["from"] = from_date
+        params["to"]   = date.today().strftime("%Y-%m-%d")
+
+    try:
+        resp = requests.get(
+            f"{_FMP_BASE}/historical-price-full/{ticker}",
+            params=params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+
+    historical = data.get("historical") if isinstance(data, dict) else None
+    if not historical:
+        return None
+
+    df = pd.DataFrame(historical)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df = df.rename(columns={
+        "open":   "Open",
+        "high":   "High",
+        "low":    "Low",
+        "close":  "Close",
+        "volume": "Volume",
+    })
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+    return df[cols] if cols else None
+
+
+# ── FMP: news ─────────────────────────────────────────────────────────────────
+def _fmp_get_news(ticker: str, max_items: int = 20) -> list[dict] | None:
+    """Fetch news from FMP stock_news endpoint.
+
+    Returns a list of dicts compatible with yfinance news format
+    (title, link/url, providerPublishTime, publisher), or None on failure.
+    """
+    api_key = _get_fmp_key()
+    if not api_key:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{_FMP_BASE}/stock_news",
+            params={"tickers": ticker, "limit": max_items, "apikey": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        articles = resp.json()
+        if not articles or not isinstance(articles, list):
+            return None
+    except Exception:
+        return None
+
+    result = []
+    for art in articles:
+        # Convert publishedDate string → unix timestamp for providerPublishTime
+        pub_ts = None
+        pub_str = art.get("publishedDate", "")
+        if pub_str:
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
+                pub_ts = int(dt.timestamp())
+            except Exception:
+                pass
+
+        result.append({
+            "title":               art.get("title", ""),
+            "link":                art.get("url", ""),
+            "url":                 art.get("url", ""),
+            "publisher":           art.get("site", ""),
+            "providerPublishTime": pub_ts,
+        })
+
+    return result or None
+
+
+# ── FMP: institutional holders ────────────────────────────────────────────────
+def _fmp_get_institutional_holders(ticker: str) -> pd.DataFrame | None:
+    """Fetch top institutional holders from FMP.
+
+    Returns a DataFrame with columns [Holder, Shares, Date Reported, Value]
+    mirroring the yfinance .institutional_holders structure, or None on failure.
+    """
+    api_key = _get_fmp_key()
+    if not api_key:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{_FMP_BASE}/institutional-holder/{ticker}",
+            params={"apikey": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return None
+    except Exception:
+        return None
+
+    rows = []
+    for h in data:
+        rows.append({
+            "Holder":        h.get("holder", ""),
+            "Shares":        h.get("shares"),
+            "Date Reported": h.get("dateReported", ""),
+            "% Out":         h.get("weightPercent"),
+        })
+    df = pd.DataFrame(rows)
+    return df if not df.empty else None
+
+
+# ── FMP: insider transactions ─────────────────────────────────────────────────
+def _fmp_get_insider_transactions(ticker: str, limit: int = 50) -> pd.DataFrame | None:
+    """Fetch insider trading records from FMP.
+
+    Returns a DataFrame mirroring yfinance .insider_transactions, or None on failure.
+    """
+    api_key = _get_fmp_key()
+    if not api_key:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{_FMP_BASE}/insider-trading",
+            params={"symbol": ticker, "limit": limit, "apikey": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return None
+    except Exception:
+        return None
+
+    rows = []
+    for rec in data:
+        rows.append({
+            "Insider":     rec.get("reportingName", ""),
+            "Position":    rec.get("typeOfOwner", ""),
+            "Transaction": rec.get("transactionType", ""),
+            "Shares":      rec.get("securitiesTransacted"),
+            "Value":       rec.get("price"),
+            "Date":        rec.get("transactionDate", ""),
+            "URL":         rec.get("link", ""),
+        })
+    df = pd.DataFrame(rows)
+    return df if not df.empty else None
+
+
 # ── yfinance ticker helper ────────────────────────────────────────────────────
 def _ticker(symbol: str) -> yf.Ticker:
     """Return a yf.Ticker; let yfinance manage its own session/cookies."""
@@ -300,7 +478,14 @@ def get_info(ticker: str) -> dict:
 # ── price history ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=_PRICE_TTL, show_spinner=False)
 def get_history(ticker: str, period: str = "2y") -> pd.DataFrame:
-    """Return OHLCV history; empty DataFrame on error."""
+    """Return OHLCV history; tries FMP first, falls back to yfinance."""
+    try:
+        df = _fmp_get_history(ticker, period)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+
     try:
         df = _ticker(ticker).history(period=period)
         return df if not df.empty else pd.DataFrame()
@@ -346,7 +531,14 @@ def get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 # ── news ──────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=_NEWS_TTL, show_spinner=False)
 def get_news(ticker: str, max_items: int = 20) -> list[dict]:
-    """Return list of news dicts from yfinance; empty list on error."""
+    """Return list of news dicts; tries FMP first, falls back to yfinance."""
+    try:
+        fmp_news = _fmp_get_news(ticker, max_items)
+        if fmp_news:
+            return fmp_news
+    except Exception:
+        pass
+
     try:
         raw = _ticker(ticker).news or []
         return raw[:max_items]
@@ -377,7 +569,14 @@ def get_major_holders(ticker: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=_INFO_TTL, show_spinner=False)
 def get_institutional_holders(ticker: str) -> pd.DataFrame:
-    """Return yfinance .institutional_holders; empty DataFrame on error."""
+    """Return institutional holders; tries FMP first, falls back to yfinance."""
+    try:
+        df = _fmp_get_institutional_holders(ticker)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+
     try:
         df = _ticker(ticker).institutional_holders
         return df if df is not None and not df.empty else pd.DataFrame()
@@ -387,7 +586,14 @@ def get_institutional_holders(ticker: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=_INFO_TTL, show_spinner=False)
 def get_insider_transactions(ticker: str) -> pd.DataFrame:
-    """Return yfinance .insider_transactions (Form 4 filings); empty DF on error."""
+    """Return insider transactions (Form 4); tries FMP first, falls back to yfinance."""
+    try:
+        df = _fmp_get_insider_transactions(ticker)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+
     try:
         df = _ticker(ticker).insider_transactions
         return df if df is not None and not df.empty else pd.DataFrame()

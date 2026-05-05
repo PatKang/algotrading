@@ -61,9 +61,11 @@ _SUGGESTIONS = [
 with st.sidebar:
     st.title("📈 Equity Analysis")
     st.markdown(
-        "Analyse and compare any publicly listed equity using live data from"
-        "[yfinance](https://github.com/ranaroussi/yfinance) and new sentiment analysis via Alpha Vantage" \
-        "This is not financial advice - but it shall give you a leg up in doing your own research and make some money"
+        "Analyse and compare any publicly listed equity using live data from "
+        "[Financial Modeling Prep](https://financialmodelingprep.com) (primary) "
+        "and [yfinance](https://github.com/ranaroussi/yfinance) (fallback), "
+        "with sentiment analysis via VADER and Alpha Vantage. "
+        "This is not financial advice."
     )
     st.markdown("---")
 
@@ -139,8 +141,8 @@ with st.sidebar:
     st.markdown("---")
     st.caption(
         "Data is cached for 15–60 min. "
-        "Prices from yfinance · Sentiment via VADER · "
-        "Optional enriched news via Alpha Vantage."
+        "Primary data from FMP · yfinance fallback · "
+        "Sentiment via VADER · Optional enriched news via Alpha Vantage."
     )
 
 
