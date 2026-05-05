@@ -366,6 +366,16 @@ def get_info(ticker: str) -> dict:
     # yfinance — broadest ratio coverage; may be blocked on Streamlit Cloud
     try:
         yf_info = _ticker(ticker).info or {}
+        # yfinance ≥0.2.x returns dividendYield as a percentage value
+        # (e.g. 0.39 for a 0.39% yield) while fmt_pct expects a 0-to-1
+        # fraction. Divide by 100 so the rest of the formatting layer is
+        # consistent with FMP's decimal format.
+        dy = yf_info.get("dividendYield")
+        if dy is not None:
+            try:
+                yf_info["dividendYield"] = float(dy) / 100
+            except (TypeError, ValueError):
+                pass
         result.update(yf_info)
     except Exception:
         # Silently swallow; FMP below may still provide data
