@@ -133,7 +133,10 @@ def _fmp_get_info(ticker: str) -> dict | None:
                 "returnOnAssets":               m.get("roaTTM"),
                 "debtToEquity":                 dte,
                 "currentRatio":                 m.get("currentRatioTTM"),
-                "dividendYield":                m.get("dividendYieldTTM"),
+                "dividendYield": (
+                    m["dividendYieldTTM"] / 100
+                    if m.get("dividendYieldTTM") is not None else None
+                ),
                 "ebitda":                       m.get("ebitdaTTM"),
             })
     except Exception:
