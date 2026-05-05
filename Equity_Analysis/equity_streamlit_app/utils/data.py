@@ -434,7 +434,17 @@ def get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 # ── news ──────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=_NEWS_TTL, show_spinner=False)
 def get_news(ticker: str, max_items: int = 20) -> list[dict]:
-    """Return list of news dicts; tries FMP first, falls back to yfinance."""
+    """Return ticker-specific news; yfinance-first (FMP stable/news/stock ignores
+    the symbol param and returns a shared feed, making it useless for per-ticker
+    sentiment scoring)."""
+    try:
+        raw = _ticker(ticker).news or []
+        if raw:
+            return raw[:max_items]
+    except Exception:
+        pass
+
+    # FMP fallback — only useful if yfinance is completely unavailable
     try:
         fmp_news = _fmp_get_news(ticker, max_items)
         if fmp_news:
@@ -442,12 +452,7 @@ def get_news(ticker: str, max_items: int = 20) -> list[dict]:
     except Exception:
         pass
 
-    try:
-        raw = _ticker(ticker).news or []
-        return raw[:max_items]
-    except Exception as e:
-        st.warning(f"⚠️ Could not fetch news for **{ticker}** ({type(e).__name__}: {e}).")
-        return []
+    return []
 
 
 # ── bulk helpers ──────────────────────────────────────────────────────────────
