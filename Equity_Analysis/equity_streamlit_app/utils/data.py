@@ -355,29 +355,45 @@ def _ticker(symbol: str) -> yf.Ticker:
 # ── ticker info ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=_INFO_TTL, show_spinner=False)
 def get_info(ticker: str) -> dict:
-    """Return fundamentals dict; tries FMP first, falls back to yfinance."""
+    """Return fundamentals dict, merging yfinance and FMP.
+
+    FMP's ratios-ttm / key-metrics-ttm endpoints are subscription-gated for
+    smaller tickers, so yfinance is used to fill ratio fields FMP cannot
+    provide.  FMP profile and ratio data override yfinance where both exist.
+    """
+    result: dict = {}
+
+    # yfinance — broadest ratio coverage; may be blocked on Streamlit Cloud
+    try:
+        yf_info = _ticker(ticker).info or {}
+        result.update(yf_info)
+    except Exception:
+        # Silently swallow; FMP below may still provide data
+        pass
+
+    # FMP — overlaid on top; overrides yfinance for any field FMP provides
     try:
         fmp_info = _fmp_get_info(ticker)
         if fmp_info:
-            return fmp_info
+            result.update(fmp_info)
     except Exception:
         pass
 
-    try:
-        info = _ticker(ticker).info or {}
-        if info:
-            return info
-    except Exception as e:
-        st.warning(
-            f"⚠️ Could not fetch info for **{ticker}** "
-            f"({type(e).__name__}: {e}). Yahoo Finance may be blocking this environment."
-        )
+    if result:
+        return result
 
+    # Last resort: yfinance fast_info (lightweight, rarely blocked)
     try:
         fi = _ticker(ticker).fast_info
         return {k: getattr(fi, k, None) for k in fi.__dict__ if not k.startswith("_")}
     except Exception:
-        return {}
+        pass
+
+    st.warning(
+        f"⚠️ Could not fetch any data for **{ticker}**. "
+        "Both Yahoo Finance and FMP failed for this ticker."
+    )
+    return {}
 
 
 # ── price history ─────────────────────────────────────────────────────────────
