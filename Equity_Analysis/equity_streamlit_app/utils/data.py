@@ -4,13 +4,13 @@ Cached data-fetching layer.  All functions use st.cache_data so that
 repeated renders within the same session (and across users on Streamlit
 Community Cloud) do not hammer the upstream APIs.
 
-Primary source for all data: Financial Modeling Prep (FMP).
+Primary source for all data: Financial Modeling Prep (FMP) stable API.
 Fallback: yfinance.
 """
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 import requests
 import streamlit as st
@@ -23,7 +23,7 @@ _PRICE_TTL  = 900   # 15 min — price / history
 _INFO_TTL   = 3600  # 1 h  — fundamentals / metadata
 _NEWS_TTL   = 1800  # 30 min — news / sentiment
 
-_FMP_BASE = "https://financialmodelingprep.com/api/v3"
+_FMP_STABLE = "https://financialmodelingprep.com/stable"
 
 
 # ── secret helpers ────────────────────────────────────────────────────────────
@@ -40,184 +40,154 @@ def _get_fmp_key() -> str | None:
     return _get_secret("FMP_KEY")
 
 
-# ── FMP: info ─────────────────────────────────────────────────────────────────
-def _fmp_get_info(ticker: str) -> dict | None:
-    """Fetch profile + key-metrics-ttm from FMP and map to yfinance field names.
-
-    Returns a dict on (partial or full) success, None if the API key is
-    missing or the profile call itself fails.
-    """
+def _fmp_get(path: str, params: dict, timeout: int = 10) -> list | dict | None:
+    """GET a FMP stable endpoint; returns parsed JSON or None on any error."""
     api_key = _get_fmp_key()
     if not api_key:
         return None
-
-    result: dict = {}
-
-    # ── profile ───────────────────────────────────────────────────────────────
     try:
         resp = requests.get(
-            f"{_FMP_BASE}/profile/{ticker}",
-            params={"apikey": api_key},
-            timeout=10,
+            f"{_FMP_STABLE}/{path}",
+            params={**params, "apikey": api_key},
+            timeout=timeout,
         )
         resp.raise_for_status()
-        profiles = resp.json()
-        if not profiles or not isinstance(profiles, list):
-            return None
-        p = profiles[0]
-
-        # Parse 52-week range string "low-high" (both sides are positive floats)
-        raw_range = str(p.get("range", "") or "")
-        if "-" in raw_range:
-            parts = raw_range.replace(" ", "").split("-")
-            try:
-                week52_low  = float(parts[0].strip())
-                week52_high = float(parts[1].strip())
-            except (ValueError, IndexError):
-                week52_low = week52_high = None
-        else:
-            week52_low = week52_high = None
-
-        result.update({
-            "marketCap":             p.get("mktCap"),
-            "beta":                  p.get("beta"),
-            "sector":                p.get("sector"),
-            "industry":              p.get("industry"),
-            "longName":              p.get("companyName"),
-            "website":               p.get("website"),
-            "longBusinessSummary":   p.get("description"),
-            "currentPrice":          p.get("price"),
-            "currency":              p.get("currency"),
-            "exchange":              p.get("exchangeShortName"),
-            "fiftyTwoWeekHigh":             week52_high,
-            "fiftyTwoWeekLow":              week52_low,
-            "regularMarketPreviousClose":   p.get("previousClose"),
-        })
+        return resp.json()
     except Exception:
         return None
 
-    # ── key-metrics-ttm ───────────────────────────────────────────────────────
-    # A failure here still returns the profile data gathered above.
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/key-metrics-ttm/{ticker}",
-            params={"apikey": api_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        metrics = resp.json()
-        if metrics and isinstance(metrics, list):
-            m = metrics[0]
 
-            # FMP debtToEquityTTM is a ratio (e.g. 1.5); yfinance reports it
-            # as a percentage (e.g. 150.0), so multiply by 100 for consistency.
-            dte = m.get("debtToEquityTTM")
-            if dte is not None:
-                try:
-                    dte = float(dte) * 100
-                except (TypeError, ValueError):
-                    dte = None
+# ── FMP: info ─────────────────────────────────────────────────────────────────
+def _fmp_get_info(ticker: str) -> dict | None:
+    """Fetch fundamentals from FMP stable API and map to yfinance field names.
 
-            result.update({
-                "enterpriseValue":              m.get("enterpriseValueTTM"),
-                "trailingPE":                   m.get("peRatioTTM"),
-                "forwardPE":                    m.get("forwardPeTTM"),
-                "pegRatio":                     m.get("pegRatioTTM"),
-                "priceToSalesTrailing12Months":  m.get("priceToSalesRatioTTM"),
-                "priceToBook":                  m.get("pbRatioTTM"),
-                "enterpriseToEbitda":           m.get("enterpriseValueOverEBITDATTM"),
-                "profitMargins":                m.get("netProfitMarginTTM"),
-                "operatingMargins":             m.get("operatingProfitMarginTTM"),
-                "grossMargins":                 m.get("grossProfitMarginTTM"),
-                "returnOnEquity":               m.get("roeTTM"),
-                "returnOnAssets":               m.get("roaTTM"),
-                "debtToEquity":                 dte,
-                "currentRatio":                 m.get("currentRatioTTM"),
-                "dividendYield": (
-                    m["dividendYieldTTM"] / 100
-                    if m.get("dividendYieldTTM") is not None else None
-                ),
-                "ebitda":                       m.get("ebitdaTTM"),
-            })
-    except Exception:
-        pass  # return partial profile data; caller will use it
+    Combines profile + ratios-ttm + key-metrics-ttm + income/balance statements.
+    Returns a dict on (partial or full) success, None if profile call fails.
+    """
+    result: dict = {}
 
-    # ── income-statement (latest record) — totalRevenue ───────────────────────
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/income-statement/{ticker}",
-            params={"apikey": api_key, "limit": 1},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        inc = resp.json()
-        if inc and isinstance(inc, list):
-            result["totalRevenue"] = inc[0].get("revenue")
-    except Exception:
-        pass
+    # ── profile ───────────────────────────────────────────────────────────────
+    profiles = _fmp_get("profile", {"symbol": ticker})
+    if not profiles or not isinstance(profiles, list):
+        return None
+    p = profiles[0]
 
-    # ── balance-sheet (latest record) — totalCash, totalDebt ─────────────────
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/balance-sheet-statement/{ticker}",
-            params={"apikey": api_key, "limit": 1},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        bs = resp.json()
-        if bs and isinstance(bs, list):
-            result["totalCash"] = bs[0].get("cashAndShortTermInvestments")
-            result["totalDebt"] = bs[0].get("totalDebt")
-    except Exception:
-        pass
+    # Parse 52-week range string "low-high"
+    raw_range = str(p.get("range", "") or "")
+    week52_low = week52_high = None
+    if "-" in raw_range:
+        parts = raw_range.replace(" ", "").split("-")
+        try:
+            week52_low  = float(parts[0])
+            week52_high = float(parts[1])
+        except (ValueError, IndexError):
+            pass
+
+    price  = p.get("price")
+    change = p.get("change")
+    prev_close = (price - change) if price is not None and change is not None else None
+
+    result.update({
+        "marketCap":                  p.get("marketCap"),
+        "beta":                       p.get("beta"),
+        "sector":                     p.get("sector"),
+        "industry":                   p.get("industry"),
+        "longName":                   p.get("companyName"),
+        "website":                    p.get("website"),
+        "longBusinessSummary":        p.get("description"),
+        "currentPrice":               price,
+        "currency":                   p.get("currency"),
+        "exchange":                   p.get("exchange"),
+        "fiftyTwoWeekHigh":           week52_high,
+        "fiftyTwoWeekLow":            week52_low,
+        "regularMarketPreviousClose": prev_close,
+    })
+
+    # ── ratios-ttm ────────────────────────────────────────────────────────────
+    ratios = _fmp_get("ratios-ttm", {"symbol": ticker})
+    if ratios and isinstance(ratios, list):
+        r = ratios[0]
+
+        # stable debtToEquityRatioTTM is a ratio (e.g. 0.80); yfinance uses
+        # percentage (e.g. 80.0), so multiply by 100 for display consistency.
+        dte = r.get("debtToEquityRatioTTM")
+        if dte is not None:
+            try:
+                dte = float(dte) * 100
+            except (TypeError, ValueError):
+                dte = None
+
+        result.update({
+            "trailingPE":                   r.get("priceToEarningsRatioTTM"),
+            "pegRatio":                     r.get("priceToEarningsGrowthRatioTTM"),
+            "priceToSalesTrailing12Months": r.get("priceToSalesRatioTTM"),
+            "priceToBook":                  r.get("priceToBookRatioTTM"),
+            "enterpriseValue":              r.get("enterpriseValueTTM"),
+            "enterpriseToEbitda":           r.get("enterpriseValueMultipleTTM"),
+            "grossMargins":                 r.get("grossProfitMarginTTM"),
+            "operatingMargins":             r.get("operatingProfitMarginTTM"),
+            "profitMargins":                r.get("netProfitMarginTTM"),
+            "currentRatio":                 r.get("currentRatioTTM"),
+            # stable dividendYieldTTM is already a 0-to-1 decimal (e.g. 0.0037
+            # for a 0.37% yield) — pass directly to fmt_pct, no division needed.
+            "dividendYield":                r.get("dividendYieldTTM"),
+            "debtToEquity":                 dte,
+        })
+
+    # ── key-metrics-ttm — ROE, ROA ────────────────────────────────────────────
+    km = _fmp_get("key-metrics-ttm", {"symbol": ticker})
+    if km and isinstance(km, list):
+        m = km[0]
+        result.update({
+            "returnOnEquity": m.get("returnOnEquityTTM"),
+            "returnOnAssets": m.get("returnOnAssetsTTM"),
+        })
+
+    # ── income-statement — totalRevenue, ebitda ───────────────────────────────
+    inc = _fmp_get("income-statement", {"symbol": ticker, "limit": 1})
+    if inc and isinstance(inc, list):
+        result["totalRevenue"] = inc[0].get("revenue")
+        result["ebitda"]       = inc[0].get("ebitda")
+
+    # ── balance-sheet — totalCash, totalDebt ─────────────────────────────────
+    bs = _fmp_get("balance-sheet-statement", {"symbol": ticker, "limit": 1})
+    if bs and isinstance(bs, list):
+        result["totalCash"] = bs[0].get("cashAndShortTermInvestments")
+        result["totalDebt"] = bs[0].get("totalDebt")
 
     return result if result else None
 
 
 # ── FMP: financials ───────────────────────────────────────────────────────────
 def _fmp_get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """Fetch income-statement and balance-sheet from FMP.
+    """Fetch income-statement and balance-sheet from FMP stable API.
 
     Returns DataFrames whose index/column structure mirrors yfinance output
     (metric-name index, Timestamp columns), or None on failure.
     """
-    api_key = _get_fmp_key()
-    if not api_key:
-        return None
-
     # ── income statement ──────────────────────────────────────────────────────
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/income-statement/{ticker}",
-            params={"apikey": api_key, "limit": 5},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        income_json = resp.json()
-        if not income_json or not isinstance(income_json, list):
-            return None
-    except Exception:
+    income_json = _fmp_get("income-statement", {"symbol": ticker, "limit": 5})
+    if not income_json or not isinstance(income_json, list):
         return None
 
-    # Mapping: yfinance row-name → FMP field key
     _INCOME_MAP: dict[str, str] = {
         "Total Revenue":    "revenue",
         "Gross Profit":     "grossProfit",
         "Operating Income": "operatingIncome",
         "Net Income":       "netIncome",
         "EBITDA":           "ebitda",
-        "Diluted EPS":      "epsdiluted",
+        "Diluted EPS":      "epsDiluted",
         "Basic EPS":        "eps",
     }
 
     income_data: dict[str, dict] = {label: {} for label in _INCOME_MAP}
     for record in income_json:
         try:
-            date = pd.Timestamp(record["date"])
+            dt = pd.Timestamp(record["date"])
         except Exception:
             continue
         for label, fmp_key in _INCOME_MAP.items():
-            income_data[label][date] = record.get(fmp_key)
+            income_data[label][dt] = record.get(fmp_key)
 
     income_df = pd.DataFrame(income_data).T
     if not income_df.empty:
@@ -225,36 +195,26 @@ def _fmp_get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame] | None
 
     # ── balance sheet ─────────────────────────────────────────────────────────
     balance_df = pd.DataFrame()
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/balance-sheet-statement/{ticker}",
-            params={"apikey": api_key, "limit": 5},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        balance_json = resp.json()
-        if balance_json and isinstance(balance_json, list):
-            _BALANCE_MAP: dict[str, str] = {
-                "Cash Cash Equivalents And Short Term Investments": "cashAndShortTermInvestments",
-                "Cash And Cash Equivalents":                        "cashAndCashEquivalents",
-                "Total Debt":                                       "totalDebt",
-                "Long Term Debt And Capital Lease Obligation":      "longTermDebt",
-            }
+    balance_json = _fmp_get("balance-sheet-statement", {"symbol": ticker, "limit": 5})
+    if balance_json and isinstance(balance_json, list):
+        _BALANCE_MAP: dict[str, str] = {
+            "Cash Cash Equivalents And Short Term Investments": "cashAndShortTermInvestments",
+            "Cash And Cash Equivalents":                        "cashAndCashEquivalents",
+            "Total Debt":                                       "totalDebt",
+            "Long Term Debt And Capital Lease Obligation":      "longTermDebt",
+        }
+        balance_data: dict[str, dict] = {label: {} for label in _BALANCE_MAP}
+        for record in balance_json:
+            try:
+                dt = pd.Timestamp(record["date"])
+            except Exception:
+                continue
+            for label, fmp_key in _BALANCE_MAP.items():
+                balance_data[label][dt] = record.get(fmp_key)
 
-            balance_data: dict[str, dict] = {label: {} for label in _BALANCE_MAP}
-            for record in balance_json:
-                try:
-                    date = pd.Timestamp(record["date"])
-                except Exception:
-                    continue
-                for label, fmp_key in _BALANCE_MAP.items():
-                    balance_data[label][date] = record.get(fmp_key)
-
-            balance_df = pd.DataFrame(balance_data).T
-            if not balance_df.empty:
-                balance_df.columns = pd.to_datetime(balance_df.columns)
-    except Exception:
-        pass  # income data is sufficient; balance is best-effort
+        balance_df = pd.DataFrame(balance_data).T
+        if not balance_df.empty:
+            balance_df.columns = pd.to_datetime(balance_df.columns)
 
     return income_df, balance_df
 
@@ -275,37 +235,25 @@ def _period_to_from_date(period: str) -> str | None:
 
 
 def _fmp_get_history(ticker: str, period: str = "2y") -> pd.DataFrame | None:
-    """Fetch daily OHLCV from FMP historical-price-full endpoint.
+    """Fetch daily OHLCV from FMP stable historical-price-eod/full endpoint.
 
     Returns a DataFrame with the same column structure as yfinance
     (Open, High, Low, Close, Volume; DatetimeIndex), or None on failure.
     """
-    api_key = _get_fmp_key()
-    if not api_key:
-        return None
-
-    params: dict = {"apikey": api_key}
+    params: dict = {"symbol": ticker}
     from_date = _period_to_from_date(period)
     if from_date:
         params["from"] = from_date
         params["to"]   = date.today().strftime("%Y-%m-%d")
 
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/historical-price-full/{ticker}",
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
+    data = _fmp_get("historical-price-eod/full", params, timeout=15)
+    # stable endpoint returns a plain list (not wrapped in {"historical": [...]})
+    if not data or not isinstance(data, list):
         return None
 
-    historical = data.get("historical") if isinstance(data, dict) else None
-    if not historical:
+    df = pd.DataFrame(data)
+    if "date" not in df.columns:
         return None
-
-    df = pd.DataFrame(historical)
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
     df = df.rename(columns={
@@ -321,46 +269,31 @@ def _fmp_get_history(ticker: str, period: str = "2y") -> pd.DataFrame | None:
 
 # ── FMP: news ─────────────────────────────────────────────────────────────────
 def _fmp_get_news(ticker: str, max_items: int = 20) -> list[dict] | None:
-    """Fetch news from FMP stock_news endpoint.
+    """Fetch news from FMP stable news/stock endpoint.
 
-    Returns a list of dicts compatible with yfinance news format
-    (title, link/url, providerPublishTime, publisher), or None on failure.
+    Returns a list of dicts compatible with yfinance news format, or None.
     """
-    api_key = _get_fmp_key()
-    if not api_key:
-        return None
-
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/stock_news",
-            params={"tickers": ticker, "limit": max_items, "apikey": api_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        articles = resp.json()
-        if not articles or not isinstance(articles, list):
-            return None
-    except Exception:
+    articles = _fmp_get("news/stock", {"symbol": ticker, "limit": max_items})
+    if not articles or not isinstance(articles, list):
         return None
 
     result = []
     for art in articles:
-        # Convert publishedDate string → unix timestamp for providerPublishTime
         pub_ts = None
         pub_str = art.get("publishedDate", "")
         if pub_str:
             try:
-                from datetime import datetime, timezone
                 dt = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
                 pub_ts = int(dt.timestamp())
             except Exception:
                 pass
 
+        url = art.get("url") or art.get("link") or ""
         result.append({
             "title":               art.get("title", ""),
-            "link":                art.get("url", ""),
-            "url":                 art.get("url", ""),
-            "publisher":           art.get("site", ""),
+            "link":                url,
+            "url":                 url,
+            "publisher":           art.get("site") or art.get("publisher") or "",
             "providerPublishTime": pub_ts,
         })
 
@@ -369,66 +302,36 @@ def _fmp_get_news(ticker: str, max_items: int = 20) -> list[dict] | None:
 
 # ── FMP: institutional holders ────────────────────────────────────────────────
 def _fmp_get_institutional_holders(ticker: str) -> pd.DataFrame | None:
-    """Fetch top institutional holders from FMP.
-
-    Returns a DataFrame with columns [Holder, Shares, Date Reported, Value]
-    mirroring the yfinance .institutional_holders structure, or None on failure.
-    """
-    api_key = _get_fmp_key()
-    if not api_key:
+    """Fetch top institutional holders from FMP stable API."""
+    data = _fmp_get(
+        "institutional-ownership/institutional-holders/symbol-ownership",
+        {"symbol": ticker},
+    )
+    if not data or not isinstance(data, list):
         return None
 
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/institutional-holder/{ticker}",
-            params={"apikey": api_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data or not isinstance(data, list):
-            return None
-    except Exception:
-        return None
-
-    rows = []
-    for h in data:
-        rows.append({
+    rows = [
+        {
             "Holder":        h.get("holder", ""),
             "Shares":        h.get("shares"),
             "Date Reported": h.get("dateReported", ""),
             "% Out":         h.get("weightPercent"),
-        })
+        }
+        for h in data
+    ]
     df = pd.DataFrame(rows)
     return df if not df.empty else None
 
 
 # ── FMP: insider transactions ─────────────────────────────────────────────────
 def _fmp_get_insider_transactions(ticker: str, limit: int = 50) -> pd.DataFrame | None:
-    """Fetch insider trading records from FMP.
-
-    Returns a DataFrame mirroring yfinance .insider_transactions, or None on failure.
-    """
-    api_key = _get_fmp_key()
-    if not api_key:
+    """Fetch insider trading records from FMP stable API."""
+    data = _fmp_get("insider-trading", {"symbol": ticker, "limit": limit})
+    if not data or not isinstance(data, list):
         return None
 
-    try:
-        resp = requests.get(
-            f"{_FMP_BASE}/insider-trading",
-            params={"symbol": ticker, "limit": limit, "apikey": api_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data or not isinstance(data, list):
-            return None
-    except Exception:
-        return None
-
-    rows = []
-    for rec in data:
-        rows.append({
+    rows = [
+        {
             "Insider":     rec.get("reportingName", ""),
             "Position":    rec.get("typeOfOwner", ""),
             "Transaction": rec.get("transactionType", ""),
@@ -436,7 +339,9 @@ def _fmp_get_insider_transactions(ticker: str, limit: int = 50) -> pd.DataFrame 
             "Value":       rec.get("price"),
             "Date":        rec.get("transactionDate", ""),
             "URL":         rec.get("link", ""),
-        })
+        }
+        for rec in data
+    ]
     df = pd.DataFrame(rows)
     return df if not df.empty else None
 
@@ -451,7 +356,6 @@ def _ticker(symbol: str) -> yf.Ticker:
 @st.cache_data(ttl=_INFO_TTL, show_spinner=False)
 def get_info(ticker: str) -> dict:
     """Return fundamentals dict; tries FMP first, falls back to yfinance."""
-    # Try FMP first
     try:
         fmp_info = _fmp_get_info(ticker)
         if fmp_info:
@@ -459,7 +363,6 @@ def get_info(ticker: str) -> dict:
     except Exception:
         pass
 
-    # Fall back to yfinance
     try:
         info = _ticker(ticker).info or {}
         if info:
@@ -470,7 +373,6 @@ def get_info(ticker: str) -> dict:
             f"({type(e).__name__}: {e}). Yahoo Finance may be blocking this environment."
         )
 
-    # fast_info is a lighter endpoint — try as last resort
     try:
         fi = _ticker(ticker).fast_info
         return {k: getattr(fi, k, None) for k in fi.__dict__ if not k.startswith("_")}
@@ -500,7 +402,6 @@ def get_history(ticker: str, period: str = "2y") -> pd.DataFrame:
 @st.cache_data(ttl=_INFO_TTL, show_spinner=False)
 def get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (income_stmt, balance_sheet); tries FMP first, falls back to yfinance."""
-    # Try FMP first
     try:
         fmp_result = _fmp_get_financials(ticker)
         if fmp_result is not None:
@@ -510,7 +411,6 @@ def get_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     except Exception:
         pass
 
-    # Fall back to yfinance
     t = _ticker(ticker)
     try:
         income = t.income_stmt
